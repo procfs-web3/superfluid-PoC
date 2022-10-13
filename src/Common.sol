@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import "forge-std/Test.sol";
 
 struct Context {
     //
     // Call context
     //
-    // app callback level
-    uint8 appCallbackLevel;
+    // callback level
+    uint8 appLevel;
     // type of call
     uint8 callType;
     // the system timestamp
     uint256 timestamp;
     // The intended message sender for the call
     address msgSender;
+
     //
     // Callback context
     //
@@ -26,23 +26,16 @@ struct Context {
     //
     // App context
     //
-    // app credit granted
-    uint256 appCreditGranted;
-    // app credit wanted by the app callback
-    uint256 appCreditWantedDeprecated;
-    // app credit used, allowing negative values over a callback session
-    // the appCreditUsed value over a callback sessions is calculated with:
-    // existing flow data owed deposit + sum of the callback agreements
-    // deposit deltas
-    // the final value used to modify the state is determined by the
-    // _adjustNewAppCreditUsed function (in AgreementLibrary.sol) which takes
-    // the appCreditUsed value reached in the callback session and the app
-    // credit granted
-    int256 appCreditUsed;
+    // app allowance granted
+    uint256 appAllowanceGranted;
+    // app allowance wanted by the app callback
+    uint256 appAllowanceWanted;
+    // app allowance used, allowing negative values over a callback session
+    int256 appAllowanceUsed;
     // app address
     address appAddress;
-    // app credit in super token
-    ISuperToken appAllowanceToken;
+    // app allowance in super token
+    ISuperfluidToken appAllowanceToken;
 }
 
 interface IERC20 {
@@ -104,6 +97,8 @@ interface IIDA is ISuperAgreement {
     function getSubscription(ISuperfluidToken token, address publisher, uint32 indexId, address subscriber) external view returns (bool, bool, uint128, uint256);
     function updateIndex(ISuperToken token, uint32 indexId, uint128 indexValue, bytes calldata ctx) external returns(bytes memory newCtx);
     function updateSubscription(ISuperToken token, uint32 indexId, address subscriber, uint128 units, bytes calldata ctx) external returns (bytes memory newCtx);
+    function revokeSubscription(ISuperfluidToken token, address publisher, uint32 indexId, bytes calldata ctx) external returns (bytes memory newCtx);
+    function approveSubscription(ISuperfluidToken token, address publisher, uint32 indexId,  bytes calldata ctx) external returns(bytes memory newCtx);
     function claim(ISuperToken token, address publisher, uint32 indexId, address subscriber, bytes calldata ctx) external returns(bytes memory newCtx);
     function listSubscriptions(ISuperfluidToken token, address subscriber) external view returns(address[] memory publishers, uint32[] memory indexIds, uint128[] memory unitsList);
 }
@@ -145,6 +140,11 @@ interface IReceiverMaster {
     function qiPool() external view returns (ISwapPair);
 }
 
+interface IStreamExchange {
+    function getOwner() external view returns (address);
+    function getInputToken() external view returns (ISuperToken);
+    function getOuputToken() external view returns (ISuperToken);
+}
 
 contract Receiver {
 
@@ -234,14 +234,12 @@ library ContextDefinitions {
         return uint256(appCallbackLevel) | (uint256(callType) << CALL_INFO_CALL_TYPE_SHIFT);
     }
 
-    function serializeContext(Context memory context)
-        internal pure
-        returns (bytes memory ctx)
+    function serializeContext(Context memory context) internal pure returns (bytes memory ctx)
     {
-        uint256 callInfo = ContextDefinitions.encodeCallInfo(context.appCallbackLevel, context.callType);
-        uint256 creditIO =
-            uint128(context.appCreditGranted) |
-            (uint256(uint128(context.appCreditWantedDeprecated)) << 128);
+        uint256 callInfo = ContextDefinitions.encodeCallInfo(context.appLevel, context.callType);
+        uint256 allowanceIO =
+            uint128(context.appAllowanceGranted) |
+            (uint256(uint128(context.appAllowanceWanted) << 128));
         // NOTE: nested encoding done due to stack too deep error when decoding in _decodeCtx
         ctx = abi.encode(
             abi.encode(
@@ -252,12 +250,49 @@ library ContextDefinitions {
                 context.userData
             ),
             abi.encode(
-                creditIO,
-                context.appCreditUsed,
+                allowanceIO,
+                context.appAllowanceUsed,
                 context.appAddress,
                 context.appAllowanceToken
             )
         );
+    }
+
+    function unserializeContext(bytes memory ctx) internal pure returns (Context memory context) {
+        bytes memory ctx1;
+        bytes memory ctx2;
+        (ctx1, ctx2) = abi.decode(ctx, (bytes, bytes));
+        {
+            uint256 callInfo;
+            (
+                callInfo,
+                context.timestamp,
+                context.msgSender,
+                context.agreementSelector,
+                context.userData
+            ) = abi.decode(ctx1, (
+                uint256,
+                uint256,
+                address,
+                bytes4,
+                bytes));
+            (context.appLevel, context.callType) = ContextDefinitions.decodeCallInfo(callInfo);
+        }
+        {
+            uint256 allowanceIO;
+            (
+                allowanceIO,
+                context.appAllowanceUsed,
+                context.appAddress,
+                context.appAllowanceToken
+            ) = abi.decode(ctx2, (
+                uint256,
+                int256,
+                address,
+                ISuperfluidToken));
+            context.appAllowanceGranted = allowanceIO & type(uint128).max;
+            context.appAllowanceWanted = allowanceIO >> 128;
+        }
     }
 }
 
